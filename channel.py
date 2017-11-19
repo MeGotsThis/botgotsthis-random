@@ -2,13 +2,14 @@
 import re
 from collections import defaultdict
 from datetime import datetime, timedelta  # noqa: F401
-from typing import Any, Callable, Dict, Iterable, List, Match, Optional  # noqa: F401,E501
-from typing import Sequence, Set  # noqa: F401
+from typing import Any, Awaitable, Callable, Dict, Iterable, List, Match  # noqa: F401,E501
+from typing import Optional, Sequence, Set  # noqa: F401
 
 import aiohttp
 
 import bot
 from lib.api import twitch
+from lib.cache import CacheStore
 from lib.data import ChatCommandArgs
 from lib.data.message import Message
 from lib.helper import parser
@@ -52,7 +53,7 @@ async def commandWinner(args: ChatCommandArgs) -> bool:
         args.chat.send('nobody! Twitch, why do you error!')
         return False
 
-    noLurk: Optional[str] = await args.database.getChatProperty(
+    noLurk: Optional[str] = await args.data.getChatProperty(
         args.chat.channel, 'winnerNoLurk')
     user: str
     if noLurk is not None:
@@ -109,13 +110,13 @@ async def commandSetNoLurk(args: ChatCommandArgs) -> bool:
             duration += int(groups[3]) * 60
         if groups[4]:
             duration += int(groups[4])
-            await args.database.setChatProperty(
+            await args.data.setChatProperty(
                 args.chat.channel, 'winnerNoLurk', str(duration))
         args.chat.send(f'''\
 The !winner command will pick users who chatted in the last {duration} seconds\
 ''')
     else:
-        await args.database.setChatProperty(args.chat.channel, 'winnerNoLurk')
+        await args.data.setChatProperty(args.chat.channel, 'winnerNoLurk')
         args.chat.send('Allowed all users for !winner')
     return True
 
@@ -123,11 +124,12 @@ The !winner command will pick users who chatted in the last {duration} seconds\
 @not_feature('noroll')
 @permission('moderator')
 async def commandRoll(args: ChatCommandArgs) -> bool:
-    rollFunctions: List[Callable[[Message], Optional[str]]] = []
+    RollFunction = Callable[[Message, CacheStore], Awaitable[Optional[str]]]
+    rollFunctions: List[RollFunction] = []
 
-    if await args.database.hasFeature(args.chat.channel, 'roll.exe'):
+    if await args.data.hasFeature(args.chat.channel, 'roll.exe'):
         rollFunctions += [rollExe]
-    if await args.database.hasFeature(args.chat.channel, 'roll.emote'):
+    if await args.data.hasFeature(args.chat.channel, 'roll.emote'):
         rollFunctions += [rollEmote]
 
     rollFunctions += [
@@ -137,9 +139,9 @@ async def commandRoll(args: ChatCommandArgs) -> bool:
         rollFloat,
         rollComplex,
         ]
-    rollFunc: Callable[[Message], Optional[str]]
+    rollFunc: RollFunction
     for rollFunc in rollFunctions:
-        value: Optional[str] = rollFunc(args.message)
+        value: Optional[str] = await rollFunc(args.message, args.data)
         if value is not None:
             args.chat.send(f'The roll returns {value}!')
             return True
@@ -147,13 +149,13 @@ async def commandRoll(args: ChatCommandArgs) -> bool:
     return True
 
 
-def rollExe(message: Message) -> Optional[str]:
+async def rollExe(message: Message, data: CacheStore) -> Optional[str]:
     if len(message) >= 2 and message.lower[1] == 'exe':
         return 'http://i.imgur.com/CFyCRkP.jpg '
     return None
 
 
-def rollHexadecimal(message: Message) -> Optional[str]:
+async def rollHexadecimal(message: Message, data: CacheStore) -> Optional[str]:
     pattern: str = r'^(0[xX]|\$)([0-9a-fA-F]+)$'
     minInt: Optional[int] = None
     maxInt: Optional[int] = None
@@ -191,7 +193,7 @@ def rollHexadecimal(message: Message) -> Optional[str]:
         return prefix + number.positiveBaseStr(i, 16).rjust(numLen, '0')
 
 
-def rollBinary(message: Message) -> Optional[str]:
+async def rollBinary(message: Message, data: CacheStore) -> Optional[str]:
     pattern: str = r'^(0[bB]|%)([01]+)$'
     minInt: Optional[int] = None
     maxInt: Optional[int] = None
@@ -229,7 +231,7 @@ def rollBinary(message: Message) -> Optional[str]:
         return prefix + number.positiveBaseStr(i, 2).rjust(numLen, '0')
 
 
-def rollInteger(message: Message) -> Optional[str]:
+async def rollInteger(message: Message, data: CacheStore) -> Optional[str]:
     try:
         minInt: int = 1
         maxInt: int = 6
@@ -251,7 +253,7 @@ def rollInteger(message: Message) -> Optional[str]:
         return None
 
 
-def rollFloat(message: Message) -> Optional[str]:
+async def rollFloat(message: Message, data: CacheStore) -> Optional[str]:
     try:
         minFloat: float = 0.0
         maxFloat: float = 1.0
@@ -269,7 +271,7 @@ def rollFloat(message: Message) -> Optional[str]:
         return None
 
 
-def rollComplex(message: Message) -> Optional[str]:
+async def rollComplex(message: Message, data: CacheStore) -> Optional[str]:
     try:
         complex1: complex = 0.0 + 0.0j
         complex2: complex = 1.0 + 1.0j
@@ -293,7 +295,7 @@ def rollComplex(message: Message) -> Optional[str]:
         return None
 
 
-def rollEmote(message: Message) -> Optional[str]:
+async def rollEmote(message: Message, data: CacheStore) -> Optional[str]:
     if len(message) >= 2 and message.lower[1] == 'emote':
         num = 1
         if len(message) >= 3:
@@ -301,7 +303,14 @@ def rollEmote(message: Message) -> Optional[str]:
                 num = int(message[2])
             except Exception:
                 pass
-        emotes: Dict[int, str] = bot.globals.globalEmotes
+        emoteSets: Optional[Set[int]] = await data.twitch_get_bot_emote_set()
+        if emoteSets is None:
+            return None
+        if not await data.twitch_load_emotes(emoteSets):
+            return None
+        emotes: Optional[Dict[int, str]] = await data.twitch_get_emotes()
+        if emotes is None:
+            return None
         emoteIds: List[int] = list(emotes.keys())
         randomEmotes: Iterable[str]
         randomEmotes = (emotes[random.choice(emoteIds)] for i in range(num))
